@@ -1,13 +1,10 @@
 use crate::common_data::{SIGNATURE};
-use rand::Rng;
 use serde_json::{Map, Value};
 use digest::Digest;
 use sha2::Sha256;
 use crate::sd_algorithms::hashes::hash_sd_algorithm::HashSdAlgorithm;
 use crate::sd_algorithms::sd_algorithm::SdAlgorithm;
 
-/// Salt dimension in bytes.
-const SALT_DIMENSION: usize = 16;   // 16 u8 = 16 * 8 = 128 bits
 /// Name of the list of hashes as a field of the VC.
 const HASHES: &str = "hashes";
 /// Name of the Salt-Value Container as a field of the VC.
@@ -24,18 +21,6 @@ impl SdAlgorithm for SdJwtInstance {
 impl HashSdAlgorithm for SdJwtInstance {}
 
 impl SdJwtInstance {
-
-    /// A function to randomly generate salts.
-    ///
-    /// # Returns
-    /// The vector of salts created.
-    fn generate_random_salt() -> String {
-        let mut bytes = vec![0; SALT_DIMENSION];
-        let mut rng = rand::rng();
-
-        rng.fill(&mut bytes[..]);
-        multibase::Base::Base64Url.encode(bytes)
-    }
 
     /// Function to map a claim name, a claim value and a salt into a hash.
     ///

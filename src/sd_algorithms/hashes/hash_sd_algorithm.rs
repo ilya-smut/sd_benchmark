@@ -1,7 +1,23 @@
 use josekit::jws::ES256;
+use rand::Rng;
 
 /// Trait that implements several methods shared across different algorithm instances.
 pub trait HashSdAlgorithm {
+
+    /// Salt dimension in bytes.
+    const SALT_DIMENSION: usize = 16;   // 16 u8 = 16 * 8 = 128 bits
+
+    /// A function to randomly generate salts.
+    ///
+    /// # Returns
+    /// The vector of salts created.
+    fn generate_random_salt() -> String {
+        let mut bytes = vec![0; Self::SALT_DIMENSION];
+        let mut rng = rand::rng();
+
+        rng.fill(&mut bytes[..]);
+        multibase::Base::Base64Url.encode(bytes)
+    }
 
     /// Given an array of bytes to be signed, and a private key, returns a ES256 signature.
     ///

@@ -7,6 +7,8 @@ use crate::sd_algorithms::sd_algorithm::SdAlgorithm;
 
 /// Identifier for the root of the merkle tree as a field of the VC/VP.
 const ROOT: &str = "root";
+/// Identifier for the salts used for each claim in the Merkle Tree
+const SALTS: &str = "salts";
 /// Identifier for the merkle tree proof field in the VC/VP.
 const MERKLE_PROOF: &str = "merkle_proof";
 /// Identifier for leaves' length in the merkle tree.
@@ -51,20 +53,66 @@ impl MerkleTreeInstance {
     ///
     /// # Arguments
     /// * `claims` - Key-Value map of the claims to be converted.
+    /// * `salts` - Key-Value map of the salts to be used in hashing.
     ///
     /// # Returns
     /// A vector containing the hashes of the leaves encoded as byte arrays.
-    fn convert_claim_to_leaves(claims: &Map<String, Value>) -> Vec<[u8;HASH_LEN]> {
-        let leaves: Vec<[u8; HASH_LEN]> = claims.iter().filter_map(|(key, value)| {
-            if let Value::String(val) = value {
-                Some(Self::map_key_value_to_sha256(key.clone(), val.clone()))
-            } else {
-                None
-            }
-        }).collect();
-        leaves
+    fn convert_claims_and_salts_to_leaves(claims: &Map<String, Value>, salts: &Map<String, Value>) -> Result<Vec<[u8; HASH_LEN]>, String> {
+        let mut leaves = vec![];
+
+        for (key, claim) in claims {
+            let claim = match claim {
+                Value::String(claim) => claim.clone(),
+                _ => return Err(format!("Claim in key {} is not a string", key))
+            };
+
+            let salt_value = match salts.get(key) {
+                Some(salt) => salt.clone(),
+                _ => return Err(format!("Salt {} not found in claims", key))
+            };
+
+            let salt = match salt_value {
+                Value::String(salt) => salt.clone(),
+                _ => return Err(format!("Salt {} is not a string", key))
+            };
+
+            claim.clone().push_str(salt.as_str());
+            leaves.push(Self::map_key_value_to_sha256(key.clone(), claim));
+        }
+
+        Ok(leaves)
     }
 
+    /// Filters the VC or VP passed as input to only include the salts corresponding to the
+    /// disclosed claims present in the disclosure vector.
+    ///
+    /// # Arguments
+    /// * `map` - VC from which it's necessary to filter the salts.
+    /// * `disclosures` - A vector of strings that contains the disclosures to be inserted in the VP.
+    ///
+    /// # Returns
+    /// Returns a result containing an array of disclosed indices or a string representing an error.
+    fn filter_salts_by_disclosure_and_insert(map: &mut Map<String, Value>, disclosures: &Vec<String>) -> Result<(), String> {
+
+        let salts: &Map<String, Value> = &Self::get_and_decode(map, SALTS.to_string())?;
+        let mut disclosed_salts: Map<String, Value> = Map::new();
+        let mut disclosed_indices: Vec<usize> = vec![];
+
+        'disclosure_loop: for disclosure in disclosures {
+            for (i, (key, value)) in salts.iter().enumerate() {
+                if *key == *disclosure {
+                    disclosed_salts.insert(key.clone(), value.clone());
+                    disclosed_indices.push(i);
+                    continue 'disclosure_loop;
+                }
+            }
+        }
+
+        Self::serialize_and_insert(map, SALTS.to_string(), &disclosed_salts)?;
+
+        Ok(())
+
+    }
 
     /// High level function for the verification of the merkle tree root signature.
     ///
@@ -119,12 +167,16 @@ impl MerkleTreeInstance {
         let mut vc = raw_vc.clone();
 
         let claims: &Map<String, Value> = Self::extract_claims(&vc)?;
-        let leaves = Self::convert_claim_to_leaves(claims);
+        let salts: &Map<String, Value> = &claims.into_iter().map(|(key, _)|{
+            (key.clone(), Value::String(Self::generate_random_salt()))
+        }).collect();
+        let leaves = Self::convert_claims_and_salts_to_leaves(claims, salts)?;
 
         let merkle_root: [u8; HASH_LEN] = Self::derive_root_from_leaves(&leaves)?;
 
         Self::serialize_and_insert(&mut vc, ROOT.to_string(), &merkle_root)?;
         Self::serialize_and_insert(&mut vc, LEN.to_string(), &leaves.len())?;
+        Self::serialize_and_insert(&mut vc, SALTS.to_string(), &salts)?;
 
         let signer = match ES256.signer_from_pem(issuer_private_key) {
             Ok(signer) => { signer }
@@ -154,7 +206,8 @@ impl MerkleTreeInstance {
     pub fn verify_vc(vc: &Map<String, Value>, issuer_public_key: &impl AsRef<[u8]>) -> Result<(), String> {
 
         let claims: &Map<String, Value> = Self::extract_claims(vc)?;
-        let leaves: Vec<[u8; HASH_LEN]> = Self::convert_claim_to_leaves(claims);
+        let salts: &Map<String, Value> = &Self::get_and_decode(vc, SALTS.to_string())?;
+        let leaves: Vec<[u8; HASH_LEN]> = Self::convert_claims_and_salts_to_leaves(claims, salts)?;
         let computed_root: [u8; HASH_LEN] = Self::derive_root_from_leaves(&leaves)?;
         let vc_root: [u8; HASH_LEN] = Self::derive_root_from_leaves(&leaves)?;
 
@@ -180,9 +233,14 @@ impl MerkleTreeInstance {
     pub fn issue_vp(vc: &Map<String, Value>, disclosures: &Vec<String>, holder_private_key: &impl AsRef<[u8]>) -> Result<(Map<String, Value>, String), String> {
 
         let mut vp: Map<String, Value> = vc.clone();
-        let leaves: Vec<[u8; HASH_LEN]> = Self::convert_claim_to_leaves(Self::extract_claims(&mut vp)?);
+        let claims: &Map<String, Value> = Self::extract_claims(vc)?;
+        let salts: &Map<String, Value> = &Self::get_and_decode(vc, SALTS.to_string())?;
+        let leaves: Vec<[u8; HASH_LEN]> = Self::convert_claims_and_salts_to_leaves(claims, salts)?;
         let merkle_tree: MerkleTree<Sha256> = MerkleTree::from_leaves(leaves.as_slice());
+
+        Self::filter_salts_by_disclosure_and_insert(&mut vp, disclosures)?;
         let disclosed_indices = Self::filter_claims_by_disclosure_and_insert(&mut vp, disclosures)?;
+
         let merkle_proof: MerkleProof<Sha256> = merkle_tree.proof(&disclosed_indices);
         let proof_bytes = merkle_proof.to_bytes();
 
@@ -207,6 +265,7 @@ impl MerkleTreeInstance {
 
         let vp = Self::decode_and_verify_jwt(&jwt, &holder_public_key)?;
         let disclosed_claims = Self::extract_claims(&vp)?;
+        let disclosed_salts = &Self::get_and_decode(&vp, SALTS.to_string())?;
 
         let proof_bytes: Vec<u8> = Self::get_and_decode(&vp, MERKLE_PROOF.to_string())?;
         let proof: MerkleProof<Sha256> = match MerkleProof::from_bytes(proof_bytes.as_slice()) {
@@ -216,7 +275,7 @@ impl MerkleTreeInstance {
 
         let disclosed_indices: Vec<usize> = Self::get_and_decode(&vp, DISCLOSED_INDICES.to_string())?;
         let leaves_len: usize = Self::get_and_decode(&vp, LEN.to_string())?;
-        let disclosed_leaves = Self::convert_claim_to_leaves(&disclosed_claims);
+        let disclosed_leaves = Self::convert_claims_and_salts_to_leaves(&disclosed_claims, &disclosed_salts)?;
         let merkle_root_vec: Vec<u8> = Self::verify_root_signature(&vp, issuer_public_key)?;
         let mut merkle_root: [u8; HASH_LEN] = [0u8; HASH_LEN];
 
